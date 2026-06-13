@@ -1,0 +1,141 @@
+# ══════════════════════════════════════════════════════════
+# WHY A SEPARATE WORKFLOW FOR STOREFRONT?
+#
+# The React frontend is different from Spring Boot services:
+#   - Uses npm, not Maven
+#   - No unit test command yet (placeholder added)
+#   - Built with `npm run build` → produces a dist/ folder
+#   - Served by Nginx in production (not a JAR file)
+#   - Needs VITE_API_URL set at BUILD TIME (not runtime)
+#     so React knows the api-gateway's LoadBalancer URL
+#
+# This file lives in shopsphere-storefront repo at:
+#   .github/workflows/ci-cd.yml
+# ══════════════════════════════════════════════════════════
+
+name: Storefront CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/shopsphere-storefront
+
+jobs:
+  # ══════════════════════════════════════════════════════
+  # JOB 1: BUILD REACT APP + DOCKER IMAGE
+  # ══════════════════════════════════════════════════════
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'   # caches node_modules between runs
+
+      - name: Install dependencies
+        run: npm ci   # like npm install but faster and deterministic in CI
+
+      # Placeholder — add Vitest or Jest tests here later
+      # - name: Run tests
+      #   run: npm test
+
+      # VITE_API_URL is the api-gateway's LoadBalancer URL.
+      # Set this in GitHub Settings → Secrets → Actions as
+      # VITE_API_URL = http://<your-alb-dns>.us-east-2.elb.amazonaws.com
+      # React bakes this into the compiled JS at build time.
+      - name: Build React app
+        run: npm run build
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 1
+
+  # ══════════════════════════════════════════════════════
+  # JOB 2: DOCKER BUILD + PUSH + DEPLOY
+  # Only runs on push to main
+  # ══════════════════════════════════════════════════════
+  deploy:
+    name: Docker Build, Push & Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region us-east-2 \
+            --name shopsphere-dev
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.14.4
+
+      - name: Deploy storefront to EKS
+        run: |
+          helm upgrade --install storefront \
+            ./kubernetes/helm/microservice \
+            -f ./kubernetes/values/storefront.yaml \
+            -n shopsphere \
+            --set image.tag=${{ github.sha }} \
+            --wait \
+            --timeout 5m
+
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/storefront \
+            -n shopsphere \
+            --timeout=5m
